@@ -49,7 +49,9 @@ impl FrameOutline {
             x1 = x1.max(a.x);
             y1 = y1.max(a.y);
         }
-        let eps = 1e-6 * (x1 - x0).abs().max((y1 - y0).abs()).max(1.0);
+        // At least a thousandth of a point: files written with rounded coordinates give a
+        // rectangle's corners slightly different values (302.9633… and 302.963), still a rectangle.
+        let eps = (1e-6 * (x1 - x0).abs().max((y1 - y0).abs())).max(1e-3);
         let on_box = |p: Point| (p.x - x0).abs() < eps || (p.x - x1).abs() < eps || (p.y - y0).abs() < eps || (p.y - y1).abs() < eps;
         let rect = edges.iter().all(|&(a, b)| ((a.x - b.x).abs() < eps || (a.y - b.y).abs() < eps) && on_box(a) && on_box(b));
         if rect {
@@ -194,4 +196,29 @@ fn flatten_closed(bp: &BezPath, tol: f64) -> (Vec<(Point, Point)>, bool) {
     });
     finish(&mut sub, closed, &mut edges);
     (edges, over)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quad(pts: [(f64, f64); 4]) -> BezPath {
+        let mut bp = BezPath::new();
+        bp.move_to(pts[0]);
+        for p in &pts[1..] {
+            bp.line_to(*p);
+        }
+        bp.close_path();
+        bp
+    }
+
+    /// A rectangle whose corners were rounded differently (as IDML writers do) is still a
+    /// rectangle, not a shaped frame; a visibly slanted edge is a shape.
+    #[test]
+    fn rounded_rectangle_corners_are_a_rectangle() {
+        let r = quad([(302.9633333333333, 53.0), (302.963, 153.819), (528.927, 153.819), (528.9266666666667, 53.0)]);
+        assert!(FrameOutline::new(&r, 0.0).is_none());
+        let slanted = quad([(302.9, 53.0), (302.963, 153.819), (528.927, 153.819), (528.927, 53.0)]);
+        assert!(FrameOutline::new(&slanted, 0.0).is_some());
+    }
 }

@@ -572,6 +572,19 @@ fn read_otf_features(e: &El, a: &mut CharAttrs) {
         designcraft_doc::otf::set_stylistic_sets(&mut otf_list, m.max(0.0) as u32);
         any = true;
     }
+    // The `OpenTypeFeatures` list (any tag, with a value) wins over the attributes above.
+    if let Some(l) = e.prop_el("OpenTypeFeatures") {
+        for item in l.find_all("ListItem") {
+            let mut parts = item.find_all("ListItem").map(El::text_content);
+            let (Some(tag), Some(value)) = (parts.next(), parts.next()) else { continue };
+            let tag = tag.trim().trim_start_matches("$ID/");
+            let Ok(value) = value.trim().parse::<u32>() else { continue };
+            if tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                designcraft_doc::otf::set_value(&mut otf_list, tag, value);
+            }
+        }
+        any = true;
+    }
     if any {
         a.otf_features = Some(otf_list);
     }

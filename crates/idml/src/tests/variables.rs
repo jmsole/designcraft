@@ -117,6 +117,27 @@ fn text_variables_show_their_values_and_round_trip() {
     assert_eq!(glyphs(&back).0, glyphs(&d).0);
 }
 
+/// InDesign writes a custom variable's text as a `<Properties><Contents>` child, not an attribute.
+#[test]
+fn custom_variable_contents_read_from_properties() {
+    let vars = VARIABLES.replace(
+        r#"<CustomTextVariablePreference Contents="First edition" />"#,
+        r#"<CustomTextVariablePreference><Properties><Contents type="string">1.000</Contents></Properties></CustomTextVariablePreference>"#,
+    );
+    let map = DESIGNMAP.replacen("\n  <idPkg:Story", &vars, 1);
+    let bytes = zip_files(&[
+        ("designmap.xml", &map),
+        ("Resources/Graphic.xml", GRAPHIC),
+        ("Resources/Styles.xml", STYLES),
+        ("Resources/Preferences.xml", PREFS),
+        ("MasterSpreads/MasterSpread_m1.xml", MASTER),
+        ("Spreads/Spread_sp1.xml", SPREAD),
+        ("Stories/Story_s1.xml", STORY),
+    ]);
+    let d = import_idml_with(&bytes, &|_| None).unwrap();
+    assert_eq!(d.text_variables[d.variable("Edition").unwrap()].kind, VarKind::Custom { text: "1.000".into() });
+}
+
 #[test]
 fn predefined_variables_round_trip() {
     let mut d = Document::new(&NewDocument::default());

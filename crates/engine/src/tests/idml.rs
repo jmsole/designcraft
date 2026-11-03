@@ -249,7 +249,7 @@ fn open_type_features_round_trip_through_idml() {
     let f = st.format_after(0).over.otf_features.clone().unwrap_or_default();
     assert!(designcraft_doc::otf::is_on(&f, "frac"), "{f:?}");
     assert_eq!(designcraft_doc::otf::figures(&f), "tabularOldstyle");
-    assert_eq!(designcraft_doc::otf::stylistic_sets(&f), 0b100);
+    assert_eq!(designcraft_doc::otf::stylistic_sets(&f), 1 << 3);
     // Text after the selection has no features of its own.
     let after = st.format_after(5).over.otf_features.clone().unwrap_or_default();
     assert!(!designcraft_doc::otf::is_on(&after, "frac") && designcraft_doc::otf::stylistic_sets(&after) == 0, "{after:?}");

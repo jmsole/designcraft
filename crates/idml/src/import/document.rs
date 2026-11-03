@@ -148,10 +148,11 @@ impl<'r> Importer<'r> {
             return;
         }
         let pref = e.elements().find(|c| c.local().ends_with("Preference"));
-        let attr = |k: &str| pref.and_then(|p| p.get(k)).unwrap_or("");
-        let date = || Some(attr("Format")).filter(|f| !f.is_empty()).unwrap_or("MM/dd/yy").to_string();
+        // An attribute, or a `<Properties>` child as InDesign writes `Contents`.
+        let attr = |k: &str| pref.and_then(|p| p.prop(k)).unwrap_or_default();
+        let date = || Some(attr("Format")).filter(|f| !f.is_empty()).unwrap_or_else(|| "MM/dd/yy".into());
         let kind = match ty {
-            "CustomTextType" => Some(VarKind::Custom { text: attr("Contents").into() }),
+            "CustomTextType" => Some(VarKind::Custom { text: attr("Contents") }),
             "LastPageNumberType" => Some(VarKind::LastPageNumber { section: attr("Scope") == "SectionScope" }),
             "ChapterNumberType" => Some(VarKind::ChapterNumber),
             "FileNameType" if attr("IncludePath") != "true" => Some(VarKind::FileName { extension: attr("IncludeExtension") == "true" }),
@@ -164,7 +165,7 @@ impl<'r> Importer<'r> {
                 let use_ = if attr("SearchStrategy") == "LastOnPage" { Use::LastOnPage } else { Use::FirstOnPage };
                 // Change Case and Delete End Punctuation aren't modelled: the header shows the text as set.
                 (!r.is_empty()).then(|| VarKind::RunningHeader {
-                    style: if character { self.char_style_ref(r) } else { self.para_style_ref(r) },
+                    style: if character { self.char_style_ref(&r) } else { self.para_style_ref(&r) },
                     use_,
                     character,
                 })
@@ -175,8 +176,8 @@ impl<'r> Importer<'r> {
         let v = match kind {
             Some(kind) => {
                 let mut v = TextVariable::new(&name, kind);
-                v.before = attr("TextBefore").into();
-                v.after = attr("TextAfter").into();
+                v.before = attr("TextBefore");
+                v.after = attr("TextAfter");
                 v
             }
             None => TextVariable::new(

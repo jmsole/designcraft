@@ -2228,12 +2228,84 @@ fn justified_content_clears_footnotes(mode: designcraft_doc::VerticalJustificati
         assert_eq!(ft.notes.len(), 1);
         assert_eq!(ft.notes[0].rect, original.notes[0].rect, "footnotes must not move");
         let limit = ft.notes[0].rect.y0 - d.footnote_options.space_before;
-        assert!(ft.lines.iter().all(|l| l.baseline + l.descent <= limit + 0.01), "lines overlap footnotes in {mode:?}, span {span}");
+        // Bottom and Center let descenders hang below the limit (InDesign); Justify keeps them in.
+        let hang = matches!(mode, designcraft_doc::VerticalJustification::Bottom | designcraft_doc::VerticalJustification::Center);
+        assert!(
+            ft.lines.iter().all(|l| l.baseline + if hang { 0.0 } else { l.descent } <= limit + 0.01),
+            "lines overlap footnotes in {mode:?}, span {span}"
+        );
         assert!(ft.tables.iter().flat_map(|t| &t.cells).all(|c| c.rect.y1 <= limit + 0.01), "cells overlap footnotes in {mode:?}, span {span}");
         assert!(ft.lines.last().unwrap().baseline > original.lines.last().unwrap().baseline + 0.01, "content must still move down");
         if table {
             assert_eq!(ft.tables.len(), 1);
             assert!(ft.tables[0].rect.y1 > original.tables[0].rect.y1 + 0.01, "table must still move down");
+        }
+    }
+}
+
+/// Bottom alignment puts the last baseline on the frame's bottom; the descent hangs below it, as
+/// InDesign does (measured on a one-line cover name). Whether the descent would fit or not.
+#[test]
+fn bottom_alignment_sets_the_last_baseline_on_the_frame_bottom() {
+    let top = |h: f64| {
+        let (d, sid, fid) = doc_with("Name", Rect::new(0.0, 100.0, 400.0, 100.0 + h), ParaAttrs::default());
+        (d, sid, fid)
+    };
+    // The first baseline and descent of the line, top aligned.
+    let (d, sid, fid) = top(200.0);
+    let l = compose_story(&d, sid, &ComposeOptions::default()).frame(fid).unwrap().lines[0].clone();
+    let (first, descent) = (l.baseline - 100.0, l.descent);
+    assert!(descent > 1.0);
+    // Setar's case: baseline + descent overflows the frame. Sets' case: it fits with room to spare.
+    for h in [first + descent / 2.0, first + descent + 40.0] {
+        let (mut d, sid, fid) = top(h);
+        d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.vertical_justification = designcraft_doc::VerticalJustification::Bottom;
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        assert!(!cs.is_overset(), "height {h}");
+        let ft = cs.frame(fid).unwrap();
+        assert_eq!(ft.lines.len(), 1);
+        assert!((ft.lines[0].baseline - (100.0 + h)).abs() < 1e-6, "height {h}: baseline {} not on the bottom", ft.lines[0].baseline);
+        // Center moves the text half as far: halfway between the top position and the bottom
+        // (InDesign, measured on one- and three-line frames).
+        d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.vertical_justification = designcraft_doc::VerticalJustification::Center;
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        let b = cs.frame(fid).unwrap().lines[0].baseline;
+        assert!((b - (100.0 + first + (h - first) / 2.0)).abs() < 1e-6, "height {h}: centred baseline {b}");
+    }
+}
+
+/// Paragraph rules (solid or drawn as a shape) move with their lines when the frame is bottom
+/// aligned or centred.
+#[test]
+fn paragraph_rules_follow_vertical_justification() {
+    use designcraft_doc::{Rule, StrokeType, VerticalJustification as V};
+    for kind in [StrokeType::Solid, StrokeType::Dashed { pattern: vec![6.0, 2.0] }] {
+        let para = ParaAttrs {
+            rule_below: Some(Rule { on: true, weight: 1.0, offset: 4.0, kind: kind.clone(), ..Default::default() }),
+            ..Default::default()
+        };
+        let (mut d, sid, fid) = doc_with("One\nTwo", Rect::new(0.0, 0.0, 300.0, 300.0), para);
+        let rules = |d: &Document| {
+            let cs = compose_story(d, sid, &ComposeOptions::default());
+            let ft = cs.frame(fid).unwrap();
+            let top = |r: &Rect| r.y0;
+            ft.lines
+                .iter()
+                .map(|l| l.baseline)
+                .zip(ft.decos.iter().map(|d| (top(&d.rect), d.path.as_ref().map(|p| designcraft_geom::Shape::bounding_box(p).y0))))
+                .collect::<Vec<_>>()
+        };
+        let base = rules(&d);
+        for mode in [V::Bottom, V::Center] {
+            d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.vertical_justification = mode;
+            let moved = rules(&d);
+            for ((b0, (r0, p0)), (b1, (r1, p1))) in base.iter().zip(&moved) {
+                assert!(b1 - b0 > 1.0, "{mode:?}: the line moves");
+                assert!((r1 - r0 - (b1 - b0)).abs() < 1e-6, "{mode:?} {kind:?}: the rule moves with its line");
+                if let (Some(p0), Some(p1)) = (p0, p1) {
+                    assert!((p1 - p0 - (b1 - b0)).abs() < 1e-6, "{mode:?}: the rule's shape moves too");
+                }
+            }
         }
     }
 }
@@ -4999,6 +5071,17 @@ fn arabic_indic_digit_conversion_retains_original_utf8_ranges() {
     for (g, c) in gs.iter().zip("123".chars()) {
         assert_eq!(g.gid, g.face.glyph_for(c));
     }
+}
+
+/// Typed Persian digits after Latin text stay Persian (InDesign, Default digits).
+#[test]
+fn typed_persian_digits_after_latin_stay_persian() {
+    let text = "E = mc۲";
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 300.0, 100.0), ParaAttrs::default());
+    d.settings.glyph_fallback = true;
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let g = cs.frames[0].lines[0].glyphs.iter().find(|g| g.byte == text.find('۲').unwrap()).unwrap();
+    assert_eq!(g.gid, g.face.glyph_for('۲'));
 }
 
 #[test]

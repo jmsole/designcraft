@@ -93,6 +93,25 @@ impl<'a> Ex<'a> {
                 el.set("OTFFigureStyle", f.3);
             }
             el.set("OTFStylisticSets", designcraft_doc::otf::stylistic_sets(list).to_string());
+            // Features the attributes can't say (any other tag, or a value above 1) go in the list.
+            let mut said = Vec::new();
+            for (tag, ..) in designcraft_doc::otf::TOGGLES {
+                designcraft_doc::otf::set(&mut said, tag, designcraft_doc::otf::is_on(list, tag));
+            }
+            designcraft_doc::otf::set_figures(&mut said, fig);
+            designcraft_doc::otf::set_stylistic_sets(&mut said, designcraft_doc::otf::stylistic_sets(list));
+            let items: Vec<El> = list
+                .iter()
+                .filter(|t| !said.contains(t))
+                .filter_map(|t| {
+                    let value = designcraft_doc::otf::value_of(t)?;
+                    let tag = format!("$ID/{}", designcraft_doc::otf::tag_of(t));
+                    Some(El::new("ListItem").attr("type", "list").child(p("ListItem", "string", tag)).child(p("ListItem", "long", value.to_string())))
+                })
+                .collect();
+            if !items.is_empty() {
+                props.push(items.into_iter().fold(El::new("OpenTypeFeatures").attr("type", "list"), El::child));
+            }
         }
         if let Some(v) = &a.glyph_form {
             el.set("GlyphForm", v);

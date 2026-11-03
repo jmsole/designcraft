@@ -543,6 +543,63 @@ fn story_optical_margin_round_trips() {
     assert!(styles.contains(r#"IgnoreEdgeAlignment="true""#), "{styles}");
 }
 
+/// One `OpenTypeFeatures` entry: `$ID/tag` and, when given, its value.
+fn otf_entry(tag: &str, value: Option<u32>) -> String {
+    let value = value.map(|v| format!(r#"<ListItem type="long">{v}</ListItem>"#)).unwrap_or_default();
+    format!(r#"<ListItem type="list"><ListItem type="string">$ID/{tag}</ListItem>{value}</ListItem>"#)
+}
+
+fn otf_list(entries: &[(&str, Option<u32>)]) -> String {
+    let items: String = entries.iter().map(|(t, v)| otf_entry(t, *v)).collect();
+    format!(r#"<OpenTypeFeatures type="list">{items}</OpenTypeFeatures>"#)
+}
+
+/// IDML's `OpenTypeFeatures` list, as InDesign writes it for features and Glyphs-panel picks:
+/// any tag, a value (0 off, 1 on, N the Nth alternate), set over the `OTF*` attributes.
+#[test]
+fn open_type_features_list_imports_and_round_trips() {
+    let run = |attrs: &str, list: &str, text: &str| {
+        format!(
+            r#"<CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]" {attrs}><Properties>{list}</Properties><Content>{text}</Content></CharacterStyleRange>"#
+        )
+    };
+    let tabs = r#"<TabList type="list"><ListItem type="record"><Alignment type="enumeration">LeftAlign</Alignment><AlignmentCharacter type="string">.</AlignmentCharacter><Leader type="string"></Leader><Position type="unit">72</Position></ListItem></TabList>"#;
+    let story = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<idPkg:Story xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="16.0">
+  <Story Self="s1">
+    <ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/Body">{a}{b}<Br/></ParagraphStyleRange>
+    <ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/Body"><Properties>{tabs}{case}</Properties>{c}{d}</ParagraphStyleRange>
+  </Story>
+</idPkg:Story>"#,
+        a = run(r#"OTFStylisticSets="0""#, &otf_list(&[("ss01", Some(1)), ("aalt", Some(2))]), "Alt "),
+        // The list wins over an attribute for the same tag; an entry without a value is dropped.
+        b = run(r#"OTFFraction="true" OTFOrdinal="true""#, &otf_list(&[("frac", Some(0)), ("ss02", None)]), "Frac"),
+        case = otf_list(&[("case", Some(1))]),
+        c = run("", "", "Case "),
+        // A run's list replaces the paragraph's; it doesn't merge with it.
+        d = run("", &otf_list(&[("tnum", Some(1))]), "Tnum"),
+    );
+    let features = |s: &designcraft_doc::Story, at: &str| s.format_after(s.text.find(at).unwrap()).over.otf_features.clone();
+    let check = |d: &Document| {
+        let s = d.stories.values().find(|s| s.text.starts_with("Alt")).unwrap();
+        assert_eq!(features(s, "Alt").unwrap(), ["ss01", "aalt=2"]);
+        assert_eq!(features(s, "Frac").unwrap(), ["ordn"]);
+        assert_eq!(features(s, "Case").unwrap(), ["case"]);
+        assert_eq!(features(s, "Tnum").unwrap(), ["tnum"]);
+        // The paragraph's tab list is still its tab list, not features.
+        assert_eq!(s.paras[1].para.tabs.as_ref().map(|t| t.iter().map(|t| t.position).collect::<Vec<_>>()), Some(vec![72.0]));
+    };
+    let d = import_idml_with(&fixture_with_story(&story), &|_| None).unwrap();
+    check(&d);
+    let bytes = export_idml(&d);
+    let text = zip_text(&bytes, "Stories/");
+    assert!(text.contains("$ID/aalt") && text.contains("$ID/case"), "{text}");
+    // ss01 and ordn have attributes of their own and aren't repeated in the list.
+    assert!(!text.contains("$ID/ss01") && !text.contains("$ID/ordn"), "{text}");
+    check(&import_idml(&bytes).unwrap());
+}
+
 /// `[Basic Paragraph]` is InDesign's `$ID/NormalParagraphStyle`, both ways.
 #[test]
 fn basic_paragraph_is_normal_paragraph_style() {

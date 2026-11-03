@@ -12,6 +12,11 @@
 
 DesignCraft aims at full Adobe InDesign parity — and to be better: faster, open (documented JSON format + IDML), scriptable by agents (MCP), and available on the web.
 
+- **2026-11-03** · IDML's `OpenTypeFeatures` list (any tag, with a value; how InDesign stores
+  Glyphs-panel picks) imports over the `OTF*` attributes and round-trips; a value N > 1 is kept as
+  `"tag=N"` and shapes as the Nth alternate (`aalt=2`). Bottom vertical justification puts the
+  last baseline on the frame's bottom, descenders hanging below, as measured in InDesign.
+  `OTFStylisticSets` reads ssNN as bit NN, as InDesign writes it. No readiness percentage change.
 - **2026-10-28** · Inline table rows leave room for column and spanning footnotes, continuing in
   the next column or frame when needed (#1901). Cell-local footnotes contribute to row height
   and sit inside the cell rather than outside its measuring frame. Vertical justification keeps

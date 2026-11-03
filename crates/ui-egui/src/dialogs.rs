@@ -7435,7 +7435,7 @@ fn open_type_features(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, cf: &CharFi
     let mask = otf::stylistic_sets(&list);
     egui::Grid::new("csss").num_columns(10).spacing([2.0, 2.0]).show(ui, |ui| {
         for n in 1..=20u32 {
-            let bit = 1u32 << (n - 1);
+            let bit = 1u32 << n;
             if ui.add_sized([28.0, 20.0], egui::Button::selectable(mask & bit != 0, format!("{n}"))).clicked() {
                 otf::set_stylistic_sets(&mut list, mask ^ bit);
                 changed = true;

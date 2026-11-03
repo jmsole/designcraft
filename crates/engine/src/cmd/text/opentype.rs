@@ -22,7 +22,7 @@ pub(super) fn open_type(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("type.openType", format!("unknown figure style `{f}`")));
     }
     if let Some(sets) = p.get("stylisticSets").and_then(Value::as_array) {
-        let mask = sets.iter().filter_map(Value::as_u64).filter(|n| (1..=20).contains(n)).fold(0u32, |m, n| m | 1 << (n - 1));
+        let mask = sets.iter().filter_map(Value::as_u64).filter(|n| (1..=20).contains(n)).fold(0u32, |m, n| m | 1 << n);
         otf::set_stylistic_sets(&mut list, mask);
     }
     format_chars(s, &json!({"otfFeatures": list}))?;

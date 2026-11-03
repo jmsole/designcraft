@@ -102,11 +102,16 @@ pub fn feature(tag: &str) -> Option<Feature> {
         Some(r) => (false, r),
         None => (true, tag.strip_prefix('+').unwrap_or(tag)),
     };
+    // `"aalt=2"`: the value 2 (the second alternate); an "off" entry is 0 whatever its value.
+    let (t, value) = match t.split_once('=') {
+        Some((t, n)) => (t, if on { n.parse().ok()? } else { 0 }),
+        None => (t, on as u32),
+    };
     let b = t.as_bytes();
     if b.len() != 4 {
         return None;
     }
-    Some(Feature::new(Tag::new(&[b[0], b[1], b[2], b[3]]), on as u32, ..))
+    Some(Feature::new(Tag::new(&[b[0], b[1], b[2], b[3]]), value, ..))
 }
 
 /// A strong right-to-left character (Hebrew, Arabic, …)?
@@ -197,20 +202,6 @@ pub fn shape_with_context(
     out
 }
 
-/// `features` as a run in `script` takes them. Contextual alternates are part of how Arabic joins
-/// (connecting strokes, tatweel and letter variants): InDesign keeps them in Arabic text with
-/// Contextual Alternates off, so `calt` off is dropped there.
-fn script_features(features: &[Feature], script: unicode_script::Script) -> std::borrow::Cow<'_, [Feature]> {
-    use unicode_script::Script;
-    let calt = Tag::new(b"calt");
-    let off = |f: &Feature| f.tag == calt && f.value == 0;
-    if script == Script::Arabic && features.iter().any(off) {
-        features.iter().filter(|f| !off(f)).copied().collect::<Vec<_>>().into()
-    } else {
-        features.into()
-    }
-}
-
 fn shape_dir(
     face: &FontFace,
     text: &str,
@@ -221,8 +212,6 @@ fn shape_dir(
     context: ShapeContext<'_>,
 ) -> Vec<ShapedGlyph> {
     let mut out = Vec::with_capacity(text.len());
-    let features = script_features(features, script);
-    let features = &features[..];
     let shaped = face.hb().map(|hb| {
         let shaper = face.shaper.shaper(&hb).instance(face.instance.as_ref()).build();
         let mut buf = UnicodeBuffer::new();
@@ -351,16 +340,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arabic_keeps_contextual_alternates() {
-        use unicode_script::Script;
-        let off = feature("-calt").unwrap();
-        let liga = feature("-liga").unwrap();
-        let tags = |s: Script| script_features(&[off, liga], s).iter().map(|f| (f.tag, f.value)).collect::<Vec<_>>();
-        assert_eq!(tags(Script::Arabic), vec![(liga.tag, 0)]);
-        assert_eq!(tags(Script::Latin), vec![(off.tag, 0), (liga.tag, 0)]);
-    }
-
-    #[test]
     fn arabic_script_runs_do_not_inherit_the_hebrew_shaper() {
         use unicode_script::Script;
         let text = "אב بب";
@@ -421,6 +400,17 @@ mod tests {
         let off = shape(&face, "office", &[feature("-liga").unwrap()], |c| c);
         assert!(on.len() <= off.len());
         assert_eq!(off.len(), 6);
+    }
+
+    /// `"aalt=N"` picks the Nth alternate (IDML's `OpenTypeFeatures` value).
+    #[test]
+    fn feature_values_pick_alternates() {
+        // Source Sans 3's `aalt` offers `a` → a.a (710), a.b (739), A.s (1498).
+        let face = FontDb::global().face("Source Sans 3", "Regular");
+        let gid = |f: &str| shape(&face, "a", &[feature(f).unwrap()], |c| c)[0].gid;
+        assert_eq!((gid("aalt"), gid("aalt=2"), gid("aalt=3"), gid("-aalt=2")), (710, 739, 1498, 28));
+        assert_eq!(feature("aalt=x").map(|f| f.value), None);
+        assert_eq!(feature("ss01").map(|f| f.value), Some(1));
     }
 
     #[test]

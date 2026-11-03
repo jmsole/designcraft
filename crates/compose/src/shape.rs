@@ -1421,7 +1421,8 @@ fn digit_mode(p: &designcraft_doc::CharProps, arabic_context: Option<bool>) -> d
         return p.digits;
     }
     match arabic_context {
-        Some(false) => Digits::Arabic,
+        // After other scripts, figures stay as typed: InDesign keeps Persian digits after Latin.
+        Some(false) => Digits::Default,
         Some(true) if Digits::Native.map('0', &p.language) == '0' => Digits::Hindi,
         _ => Digits::Native,
     }

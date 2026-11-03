@@ -3128,6 +3128,8 @@ struct FinishInput<'a> {
 
 fn finish_composition(input: FinishInput<'_>) -> ComposedStory {
     let FinishInput { doc, story, frames, cols, notes, out, boxes, span_paras, split_paras, styles_tab } = input;
+    // Each frame's paragraph rules so far; footnote separators come after them.
+    let para_decos: Vec<usize> = out.frames.iter().map(|ft| ft.decos.len()).collect();
     notes.finish(doc, story, frames, cols, out);
     // Ranges, content heights and vertical justification.
     for (fi, ft) in out.frames.iter_mut().enumerate() {
@@ -3144,10 +3146,32 @@ fn finish_composition(input: FinishInput<'_>) -> ComposedStory {
         let before: Vec<f64> = ft.tables.iter().map(|t| ft.lines.get(t.line).map_or(0.0, |l| l.baseline)).collect();
         let spanned = ft.columns.len() > 1 && ft.lines.iter().any(|l| span_paras.get(l.para) == Some(&true))
             || ft.lines.iter().any(|l| split_paras.get(l.para) == Some(&true));
+        // Paragraph rules move with the nearest line of their column.
+        let rules: Vec<Option<(usize, f64)>> = ft
+            .decos
+            .iter()
+            .take(para_decos.get(fi).copied().unwrap_or(0))
+            .map(|d| {
+                let (cx, cy) = ((d.rect.x0 + d.rect.x1) / 2.0, (d.rect.y0 + d.rect.y1) / 2.0);
+                ft.lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.x0 <= cx && cx <= l.x1)
+                    .min_by(|a, b| (a.1.baseline - cy).abs().total_cmp(&(b.1.baseline - cy).abs()))
+                    .map(|(i, l)| (i, l.baseline))
+            })
+            .collect();
         vertical_justify(ft, f, spanned, &doc.footnote_options);
         for (t, b) in ft.tables.iter_mut().zip(before) {
             let now = ft.lines.get(t.line).map_or(b, |l| l.baseline);
             t.shift(now - b);
+        }
+        for (d, r) in ft.decos.iter_mut().zip(rules) {
+            let Some(dy) = r.and_then(|(i, b)| Some(ft.lines.get(i)?.baseline - b)).filter(|dy| *dy != 0.0) else { continue };
+            d.rect = d.rect + designcraft_geom::Vec2::new(0.0, dy);
+            if let Some(p) = &mut d.path {
+                p.apply_affine(designcraft_geom::Affine::translate((0.0, dy)));
+            }
         }
         // Anchored objects follow their (finally placed) lines.
         if !ft.objects.is_empty() {
@@ -5445,7 +5469,11 @@ fn vertical_justify(ft: &mut FrameText, f: &FrameSpec, spanned: bool, notes: &de
     for c in 0..ncols {
         let idx: Vec<usize> = ft.lines.iter().enumerate().filter(|(_, l)| spanned || l.column == c).map(|(i, _)| i).collect();
         let (Some(&a), Some(_)) = (idx.first(), idx.last()) else { continue };
-        let bottom = idx.iter().map(|&i| ft.lines[i].baseline + ft.lines[i].descent).fold(f64::NEG_INFINITY, f64::max);
+        // Bottom and Center measure from the last baseline, descenders hanging below, as InDesign
+        // does (measured: Bottom sets it on the frame's bottom, Center halfway). Justify, not yet
+        // measured, keeps the descent inside.
+        let hang = matches!(f.opts.vertical_justification, VerticalJustification::Bottom | VerticalJustification::Center);
+        let bottom = idx.iter().map(|&i| ft.lines[i].baseline + if hang { 0.0 } else { ft.lines[i].descent }).fold(f64::NEG_INFINITY, f64::max);
         let bottom = ft.tables.iter().filter(|t| spanned || t.column == c).map(|t| t.rect.y1).fold(bottom, f64::max);
         let limit = ft
             .notes
