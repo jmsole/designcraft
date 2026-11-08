@@ -524,6 +524,8 @@ fn shape_pieces(input: &ShapeInput<'_, '_>, table: &mut StyleTable<'_>, pieces: 
     let story = input.story;
     let sub = input.sub;
     let mut glyphs = Vec::new();
+    // Each run shaped on its own: its glyphs and its piece, for kerning across the boundaries.
+    let mut shaped: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = &pieces[i];
@@ -606,13 +608,107 @@ fn shape_pieces(input: &ShapeInput<'_, '_>, table: &mut StyleTable<'_>, pieces: 
         let spans_cut = |g: &Glyph| runs[1..].iter().any(|&(cut, _)| g.byte < cut && cut < g.byte + g.len);
         if group.len() > 1 && glyphs[start..].iter().any(spans_cut) {
             glyphs.truncate(start);
-            for p in group {
+            for (k, p) in group.iter().enumerate() {
+                let from = glyphs.len();
                 shape_run(db, &story.text, p.range.clone(), &p.props, p.env, &StyleRuns(&[(p.range.start, p.style)]), sub, &mut glyphs);
+                shaped.push((from..glyphs.len(), i + k));
             }
+        } else {
+            shaped.push((start..glyphs.len(), i));
         }
         i = j;
     }
+    if !sub.upright().vertical {
+        for w in shaped.windows(2) {
+            if let [(a, pa), (b, pb)] = w
+                && let (Some(left), Some(right)) = (pieces.get(*pa), pieces.get(*pb))
+            {
+                kern_across(&story.text, (left, a.clone()), (right, b.clone()), &mut glyphs);
+            }
+        }
+    }
     glyphs
+}
+
+/// Kerns the pair where two runs shaped apart meet, as InDesign does when both sides are the same
+/// font at the same size (and tracking and baseline shift) with Metrics kerning: the glyphs at the
+/// boundary get the positions the font gives them shaped together, each side with its own
+/// features. Where shaping them together would pick other glyphs, nothing changes.
+fn kern_across(text: &str, (left, a): (&Piece, std::ops::Range<usize>), (right, b): (&Piece, std::ops::Range<usize>), glyphs: &mut [Glyph]) {
+    use designcraft_fonts::ShapeContext;
+    let (lp, rp) = (&left.props, &right.props);
+    if left.range.end != right.range.start
+        || lp.kerning != Kerning::Metrics
+        || rp.kerning != Kerning::Metrics
+        || lp.jidori > 0
+        || rp.jidori > 0
+        || lp.tracking.to_bits() != rp.tracking.to_bits()
+    {
+        return;
+    }
+    // The left run's last cluster and the right run's first.
+    let Some(l0) = glyphs.get(a.clone()).and_then(|g| g.iter().rposition(|g| g.len > 0)).map(|k| a.start + k) else {
+        return;
+    };
+    let (Some(lg), Some(rg)) = (glyphs.get(l0), glyphs.get(b.start)) else {
+        return;
+    };
+    let plain = |g: &Glyph| g.generated_text.is_none() && !g.ch.is_control() && !g.upright && g.tcy.is_none() && !g.list_label;
+    if !(plain(lg) && plain(rg))
+        || lg.face != rg.face
+        || lg.lang != rg.lang
+        || lg.byte + lg.len != right.range.start
+        || rg.byte != right.range.start
+        || [lg.size, lg.sx, lg.sy, lg.shift] != [rg.size, rg.sx, rg.sy, rg.shift]
+    {
+        return;
+    }
+    let (Some(ltext), Some(rtext)) = (text.get(lg.byte..right.range.start), text.get(rg.byte..rg.byte + rg.len)) else {
+        return;
+    };
+    let caps = |p: &CharProps, s: &str| -> String {
+        if p.capitalization == Capitalization::AllCaps { s.chars().map(|c| c.to_uppercase().next().unwrap_or(c)).collect() } else { s.to_owned() }
+    };
+    let (ls, rs) = (caps(lp, ltext), caps(rp, rtext));
+    let cut = ls.len() as u32;
+    let face = &*lg.face;
+    let context = ShapeContext { before: text.get(..lg.byte).unwrap_or(""), after: text.get(rg.byte + rg.len..).unwrap_or(""), language: lg.lang };
+    let (lf, rf) = (features_for(lp), features_for(rp));
+    let both: Vec<Feature> =
+        lf.iter().map(|f| Feature { start: 0, end: cut, ..*f }).chain(rf.iter().map(|f| Feature { start: cut, end: u32::MAX, ..*f })).collect();
+    let together = designcraft_fonts::shape_with_context(face, &format!("{ls}{rs}"), &both, |c| c, context);
+    let left_alone =
+        designcraft_fonts::shape_with_context(face, &ls, &lf, |c| c, ShapeContext { after: text.get(right.range.start..).unwrap_or(""), ..context });
+    let right_alone =
+        designcraft_fonts::shape_with_context(face, &rs, &rf, |c| c, ShapeContext { before: text.get(..right.range.start).unwrap_or(""), ..context });
+    let (tl, tr): (Vec<&ShapedGlyph>, Vec<&ShapedGlyph>) = together.iter().partition(|g| (g.cluster as u32) < cut);
+    // The glyphs at the boundary, as composed.
+    let left_glyphs = l0..a.end;
+    let right_glyphs =
+        b.start..b.start + glyphs.get(b.clone()).map_or(0, |g| g.iter().skip(1).take_while(|g| g.len == 0 && g.byte == rg.byte).count() + 1);
+    let same = |shaped: &[&ShapedGlyph], alone: &[ShapedGlyph], composed: &[Glyph]| {
+        shaped.len() == alone.len()
+            && shaped.len() == composed.len()
+            && shaped.iter().zip(alone).zip(composed).all(|((s, a), c)| s.gid == a.gid && s.gid == c.gid)
+    };
+    let (Some(lc), Some(rc)) = (glyphs.get(left_glyphs.clone()), glyphs.get(right_glyphs.clone())) else {
+        return;
+    };
+    if !same(&tl, &left_alone, lc) || !same(&tr, &right_alone, rc) {
+        return;
+    }
+    let deltas: Vec<(usize, i32, i32, i32)> = left_glyphs
+        .zip(tl.iter().zip(&left_alone))
+        .chain(right_glyphs.zip(tr.iter().zip(&right_alone)))
+        .map(|(k, (s, a))| (k, s.x_advance - a.x_advance, s.x_offset - a.x_offset, s.y_offset - a.y_offset))
+        .collect();
+    for (k, adv, dx, dy) in deltas {
+        if let Some(g) = glyphs.get_mut(k) {
+            g.adv += f64::from(adv) * g.sx;
+            g.dx += f64::from(dx) * g.sx;
+            g.dy -= f64::from(dy) * g.sy;
+        }
+    }
 }
 
 /// Combining marks that start a run are shaped with the letter before them when the two runs

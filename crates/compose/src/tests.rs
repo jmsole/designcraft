@@ -6839,6 +6839,47 @@ fn contextual_lookups_see_the_neighbouring_run() {
     assert_eq!(gid_of_a(4), one_run, "the figure in the previous run is the lookup's context");
 }
 
+/// The x of each glyph on the first line of `text` in Inter, after `format` sets its runs.
+fn kerned_xs(text: &str, format: impl Fn(&mut designcraft_doc::Story)) -> Vec<(usize, f64)> {
+    let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 300.0, 100.0), ParaAttrs::default());
+    let st = d.story_mut(sid).unwrap();
+    st.format_chars(0..text.len(), |f| f.over.font_family = Some("Inter".into()));
+    format(st);
+    let cs = compose_story(&d, sid, &Default::default());
+    cs.frames[0].lines[0].glyphs.iter().map(|g| (g.byte, g.x)).collect()
+}
+
+#[test]
+fn kerning_reaches_across_runs_of_the_same_font_and_size() {
+    use designcraft_fonts::{Feature, feature};
+    // InDesign kerns the pair at a change of style when both sides are the same font at the same
+    // size: "«T" with `case` on the « alone sets as the font sets the two together, the « in its
+    // case form.
+    let text = "«T";
+    let face = designcraft_fonts::FontDb::global().face("Inter", "Regular");
+    let case = feature("case").map(|f| Feature { start: 0, end: 2, ..f }).unwrap();
+    let together = designcraft_fonts::shape(&face, text, &[case], |c| c);
+    let apart = designcraft_fonts::shape(&face, "«", &[case], |c| c);
+    let k = 12.0 / face.upem;
+    let kern = f64::from(together[0].x_advance - apart[0].x_advance) * k;
+    assert!(kern.abs() > 0.1, "Inter kerns «T with case on: {kern}");
+    let xs = kerned_xs(text, |st| st.format_chars(0..2, |f| f.over.otf_features = Some(vec!["case".into()])));
+    let x_t = xs.iter().find(|g| g.0 == 2).unwrap().1 - xs[0].1;
+    let want = f64::from(together[0].x_advance) * k;
+    assert!((x_t - want).abs() < 0.01, "T at {x_t}, kerned {want}");
+}
+
+#[test]
+fn kerning_does_not_reach_across_a_change_of_size() {
+    let text = "AV";
+    let face = designcraft_fonts::FontDb::global().face("Inter", "Regular");
+    let alone = f64::from(designcraft_fonts::shape(&face, "A", &[], |c| c)[0].x_advance) * 12.0 / face.upem;
+    let same = kerned_xs(text, |st| st.format_chars(1..2, |f| f.over.otf_features = Some(vec!["ss01".into()])));
+    assert!(same[1].1 - same[0].1 < alone - 0.1, "AV kerns across features: {} vs {alone}", same[1].1 - same[0].1);
+    let sized = kerned_xs(text, |st| st.format_chars(1..2, |f| f.over.size = Some(13.0)));
+    assert!((sized[1].1 - sized[0].1 - alone).abs() < 0.01, "no kerning across sizes: {} vs {alone}", sized[1].1 - sized[0].1);
+}
+
 #[test]
 fn tracking_stops_after_a_lines_last_glyph() {
     // InDesign tracks the space after each glyph except the line's last: a right-aligned tracked

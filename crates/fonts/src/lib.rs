@@ -280,8 +280,17 @@ fn shape_dir(
             let features = if pre.is_empty() && post.is_empty() {
                 features
             } else {
+                // The run's features, ranged to where the run sits in the buffer. The context
+                // doesn't kern: a pair across the boundary is kerned by the caller, with each
+                // side's own features (the context here has the run's).
                 let (start, end) = (pre.len() as u32, tail as u32);
-                ranged = features.iter().map(|f| Feature { start: f.start.max(start), end: f.end.min(end), ..*f }).collect();
+                let off =
+                    feature("-kern").into_iter().flat_map(|f| [Feature { start: 0, end: start, ..f }, Feature { start: end, end: u32::MAX, ..f }]);
+                ranged = features
+                    .iter()
+                    .map(|f| Feature { start: f.start.saturating_add(start).min(end), end: f.end.saturating_add(start).min(end), ..*f })
+                    .chain(off)
+                    .collect();
                 &ranged
             };
             let gb = shaper.shape(buf, ShapeOptions::new().features(features));
