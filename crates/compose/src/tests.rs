@@ -6771,6 +6771,100 @@ fn a_word_longer_than_the_line_breaks_at_the_column_edge() {
 }
 
 #[test]
+fn a_missing_non_breaking_hyphen_draws_the_fonts_hyphen() {
+    use designcraft_fonts::testing::font_mapping;
+    // A font with U+002D but neither U+2010 nor U+2011 (Baila). The shaper's own fallback maps a
+    // missing U+2011 to U+2010 only; InDesign draws the font's hyphen. The text stays U+2011, so
+    // the line still doesn't break after it.
+    let glyphs: Vec<(char, char)> = "abcdefghorsz -".chars().map(|c| (c, c)).collect();
+    designcraft_fonts::FontDb::global().add_font(font_mapping("DC Test No Hyphens", &glyphs).unwrap());
+    let text = "abcdefgh razor\u{2011}sh";
+    let at = text.find('\u{2011}').unwrap();
+    let compose = |width: f64| {
+        let para = ParaAttrs { hyphenate: Some(false), ..Default::default() };
+        let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, width, 400.0), para);
+        d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.font_family = Some("DC Test No Hyphens".into()));
+        compose_story(&d, sid, &Default::default())
+    };
+    let face = designcraft_fonts::FontDb::global().face("DC Test No Hyphens", "Regular");
+    let one = compose(1e4);
+    let line = &one.frames[0].lines[0];
+    let g = line.glyphs.iter().find(|g| g.byte == at).unwrap();
+    assert_ne!(g.gid, 0, "not .notdef");
+    assert_eq!(g.gid, face.glyph_for('-'), "drawn as the font's hyphen");
+    assert_eq!((g.len, g.generated_text.as_deref()), ('\u{2011}'.len_utf8(), None), "reads as U+2011");
+    // A measure that "abcdefgh razor‑" fills: the line breaks before "razor", not after the hyphen.
+    let width = g.x + g.adv - line.x0 + 0.5;
+    let lines: Vec<usize> = all_lines(&compose(width)).iter().map(|l| l.range.start).collect();
+    assert_eq!(lines, vec![0, 9], "no break after U+2011");
+}
+
+#[test]
+fn a_fraction_slash_makes_no_fraction_unless_fractions_are_on() {
+    // InDesign sets "1⁄4" (U+2044) as three plain glyphs; the shaper would build a fraction by
+    // itself. With Fractions (`frac`) on, it is a fraction.
+    let text = "1\u{2044}4";
+    let gids = |features: &[&str]| {
+        let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 300.0, 100.0), ParaAttrs::default());
+        d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| {
+            f.over.font_family = Some("Source Sans 3".into());
+            f.over.otf_features = Some(features.iter().map(|s| s.to_string()).collect());
+        });
+        let cs = compose_story(&d, sid, &Default::default());
+        cs.frames[0].lines[0].glyphs.iter().filter(|g| g.len > 0).map(|g| g.gid).collect::<Vec<_>>()
+    };
+    let face = designcraft_fonts::FontDb::global().face("Source Sans 3", "Regular");
+    let plain = vec![face.glyph_for('1'), face.glyph_for('\u{2044}'), face.glyph_for('4')];
+    assert_eq!(gids(&[]), plain, "no fraction");
+    let frac = gids(&["frac"]);
+    assert!(frac[0] != plain[0] && frac[2] != plain[2], "Fractions on: numerator and denominator ({frac:?})");
+}
+
+#[test]
+fn contextual_lookups_see_the_neighbouring_run() {
+    // Inter's ordinals are contextual (GSUB type 6): "a" becomes "ª" after a figure. As InDesign's Glyphs
+    // panel does it, `ordn` is on for the letter only, in a run of its own after the figure's run.
+    let text = "No 1a";
+    let gid_of_a = |from: usize| {
+        let (mut d, sid, _) = doc_with(text, Rect::new(0.0, 0.0, 300.0, 100.0), ParaAttrs::default());
+        let st = d.story_mut(sid).unwrap();
+        st.format_chars(0..text.len(), |f| f.over.font_family = Some("Inter".into()));
+        st.format_chars(from..text.len(), |f| f.over.otf_features = Some(vec!["ordn".into()]));
+        let cs = compose_story(&d, sid, &Default::default());
+        cs.frames[0].lines[0].glyphs.iter().find(|g| g.byte == 4).map(|g| g.gid).unwrap()
+    };
+    let face = designcraft_fonts::FontDb::global().face("Inter", "Regular");
+    let one_run = gid_of_a(0);
+    assert_ne!(one_run, face.glyph_for('a'), "the font's ordn changed");
+    assert_eq!(gid_of_a(4), one_run, "the figure in the previous run is the lookup's context");
+}
+
+#[test]
+fn tracking_stops_after_a_lines_last_glyph() {
+    // InDesign tracks the space after each glyph except the line's last: a right-aligned tracked
+    // label ends at the frame's edge, a centred one sits in the middle of its ink.
+    let text = "29 / 39";
+    let tracking = 60.0;
+    let untracked: HashMap<usize, f64> = tracked_lines(text, 1e5, ParaAttrs::default(), 0.0)[0].glyphs.iter().map(|g| (g.byte, g.adv)).collect();
+    let step = 60.0 / 1000.0 * 12.0;
+    for align in [Align::Left, Align::Right, Align::Center] {
+        let lines = tracked_lines(text, 200.0, ParaAttrs { align: Some(align), ..Default::default() }, tracking);
+        let l = &lines[0];
+        let ink: Vec<_> = l.glyphs.iter().filter(|g| g.visible && g.adv > 0.0 && !g.rendered_char.is_whitespace()).collect();
+        let (first, last) = (ink[0], ink[ink.len() - 1]);
+        let (left, right) = (first.x - l.x0, l.x1 - (last.x + untracked[&last.byte]));
+        match align {
+            Align::Left => assert!(left.abs() < 0.01, "left: starts {left} in"),
+            Align::Right => assert!(right.abs() < 0.01, "right: ends {right} short of the edge"),
+            _ => assert!((left - right).abs() < 0.01, "centre: {left} left, {right} right"),
+        }
+        // The glyphs before the last keep their tracking.
+        let gap = ink[1].x - ink[0].x - untracked[&ink[0].byte];
+        assert!((gap - step).abs() < 0.01, "{align:?}: tracking between glyphs is {gap}");
+    }
+}
+
+#[test]
 fn a_line_that_exactly_fills_the_measure_fits() {
     use designcraft_doc::Composer;
     let text = "#knowyourplastic";

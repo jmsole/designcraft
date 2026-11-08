@@ -4654,6 +4654,21 @@ fn layout_line(
         let h = shape::hyphen_after(g);
         line.push(h);
     }
+    // InDesign tracks the space after each glyph but the line's last: a right-aligned tracked line
+    // ends at the edge. The breaker still measures the line with it, so no break moves.
+    // Breaks, tabs and format characters at the end are not the last glyph.
+    let invisible = |g: &Glyph| {
+        g.is_space()
+            || g.ch == '\t'
+            || g.ch == story::RIGHT_INDENT_TAB
+            || breaker::is_forced(g.ch)
+            || g.ch.is_control()
+            || matches!(g.ch, '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}')
+    };
+    if let Some(g) = line.iter_mut().rev().find(|g| !invisible(g)) {
+        g.adv -= g.track;
+        g.track = 0.0;
+    }
     let measure = x1 - x0;
     // Optical margin alignment and hanging punctuation: the glyphs at the line's edges hang
     // outside the measure. A tab at an edge hangs nothing.

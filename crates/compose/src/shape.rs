@@ -58,6 +58,9 @@ pub struct Glyph {
     /// Resolved CJK boundary constraint, independent of glyph outlines.
     pub break_after: Option<bool>,
     pub cjk_hang: f64,
+    /// The tracking included in `adv` (points). InDesign adds tracking after each glyph except the
+    /// last on a line, so a line's last glyph sets without it (`layout_line`).
+    pub track: f64,
     pub moji: crate::mojikumi::Metrics,
     pub ideographic_space_elastic: bool,
     pub character_alignment: designcraft_doc::cjk::CharacterAlignment,
@@ -103,6 +106,7 @@ impl Glyph {
 
 pub const SOFT_HYPHEN: char = '\u{AD}';
 pub const NBSP: char = '\u{A0}';
+pub const NB_HYPHEN: char = '\u{2011}';
 
 /// Shaped paragraph.
 pub struct ShapedPara {
@@ -727,6 +731,20 @@ fn features_for(p: &CharProps) -> Vec<Feature> {
             v.extend(feature(&format!("{}{}", if form == tag { "" } else { "-" }, form)));
         }
     }
+    // The shaper builds a fraction around U+2044 FRACTION SLASH by itself when `frac`, or `numr`
+    // and `dnom`, may apply. InDesign doesn't: "1⁄4" stays three plain glyphs unless Fractions is
+    // on. Turning the features off globally switches that off; ones the text turns on stay on.
+    let on = |tag: &str| {
+        p.otf_features.iter().any(|f| designcraft_doc::otf::tag_of(f) == tag && designcraft_doc::otf::value_of(f).is_some_and(|n| n > 0))
+            || matches!((tag, p.position), ("numr", Position::OtNumerator) | ("dnom", Position::OtDenominator))
+    };
+    if !on("frac") {
+        for tag in ["frac", "numr", "dnom"] {
+            if !on(tag) {
+                v.extend(feature(&format!("-{tag}")));
+            }
+        }
+    }
     v
 }
 
@@ -868,6 +886,21 @@ fn shape_run_raw(
                 seg_start = i + c.len_utf8();
                 let face = if primary.covers(d) { primary.clone() } else { fallback(d) };
                 shape_segment(db, text, i..i + c.len_utf8(), Some(d.encode_utf8(&mut [0; 4])), p, &face, auto_leading, styles, out, sub.upright());
+                continue;
+            }
+        }
+        // A font without U+2011 NON-BREAKING HYPHEN draws its hyphen, as InDesign does. The text
+        // stays U+2011: it still doesn't break there and exports as itself.
+        if c == NB_HYPHEN && !primary.covers(c) {
+            let face = &primary;
+            if let Some(h) = ['\u{2010}', '-'].into_iter().find(|h| face.covers(*h)) {
+                flush(seg_start, i, &seg_face, out);
+                seg_start = i + c.len_utf8();
+                let begin = out.len();
+                shape_segment(db, text, i..i + c.len_utf8(), Some(h.encode_utf8(&mut [0; 4])), p, face, auto_leading, styles, out, sub.upright());
+                for g in out.get_mut(begin..).unwrap_or_default() {
+                    g.generated_text = None;
+                }
                 continue;
             }
         }
@@ -1133,6 +1166,7 @@ fn control_glyph(face: &Arc<FontFace>, p: &CharProps, auto_leading: TypeEnv, sty
         space: face.advance(face.glyph_for(' ')) * k * p.h_scale,
         break_after: None,
         cjk_hang: 0.0,
+        track: 0.0,
         moji: crate::mojikumi::Metrics { explicit_before: p.leading_aki.is_some(), explicit_after: p.trailing_aki.is_some(), ..Default::default() },
         ideographic_space_elastic: false,
         character_alignment: p.character_alignment,
@@ -1262,10 +1296,12 @@ fn shape_segment(
         };
         let (ascent, descent) = if up { (em_top * k_v, -em_bottom * k_v) } else { (ascent, descent) };
         let body = adv;
+        let mut track = 0.0;
         if ch == SOFT_HYPHEN {
             adv = 0.0;
         } else if last_in_cluster {
             adv += tracking + manual;
+            track = tracking;
         }
         let mark = face.glyph_is_mark(sg.gid);
         let mark_x = if mark { p.diacritic_x_offset.clamp(-1000.0, 1000.0) / 1000.0 * p.size * hs } else { 0.0 };
@@ -1298,6 +1334,7 @@ fn shape_segment(
             space,
             break_after: None,
             cjk_hang: 0.0,
+            track,
             moji: crate::mojikumi::Metrics {
                 body,
                 explicit_before: p.leading_aki.is_some(),
@@ -1441,6 +1478,7 @@ pub(crate) fn hyphen_after(g: &Glyph) -> Glyph {
     h.rendered_char = '-';
     h.moji = Default::default();
     h.generated_text = None;
+    h.track = 0.0;
     h
 }
 

@@ -202,6 +202,46 @@ pub fn shape_with_context(
     out
 }
 
+/// Characters of a neighbouring run the shaper sees as context, at most: enough for the backtrack
+/// and lookahead of contextual lookups (Litoral's ordinals look back one figure).
+const RUN_CONTEXT_CHARS: usize = 8;
+
+/// The part of `before` / `after` that may sit in the buffer next to a run of `script` and
+/// direction `rtl`: the characters up to the nearest space, break, or character of another script
+/// or direction, at most [`RUN_CONTEXT_CHARS`].
+fn run_context<'a>(before: &'a str, after: &'a str, rtl: bool, script: unicode_script::Script) -> (&'a str, &'a str) {
+    use unicode_script::{Script, UnicodeScript};
+    let fits = |c: char| {
+        let s = c.script();
+        !c.is_whitespace()
+            && !c.is_control()
+            && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{FFFC}')
+            && (matches!(s, Script::Common | Script::Inherited) || s == script)
+            && (is_rtl(c) == rtl || !is_strong(c))
+    };
+    let mut from = before.len();
+    for (n, (i, c)) in before.char_indices().rev().enumerate() {
+        if n >= RUN_CONTEXT_CHARS || !fits(c) {
+            break;
+        }
+        from = i;
+    }
+    let mut to = 0;
+    for (n, (i, c)) in after.char_indices().enumerate() {
+        if n >= RUN_CONTEXT_CHARS || !fits(c) {
+            break;
+        }
+        to = i + c.len_utf8();
+    }
+    (before.get(from..).unwrap_or(""), after.get(..to).unwrap_or(""))
+}
+
+/// A character with a strong bidi direction (left-to-right or right-to-left).
+fn is_strong(c: char) -> bool {
+    use unicode_bidi::BidiClass::{AL, L, R};
+    matches!(unicode_bidi::bidi_class(c), L | R | AL)
+}
+
 fn shape_dir(
     face: &FontFace,
     text: &str,
@@ -214,34 +254,72 @@ fn shape_dir(
     let mut out = Vec::with_capacity(text.len());
     let shaped = face.hb().map(|hb| {
         let shaper = face.shaper.shaper(&hb).instance(face.instance.as_ref()).build();
-        let mut buf = UnicodeBuffer::new();
-        for (i, c) in text.char_indices() {
-            buf.add(map(c), i as u32);
+        // `text` with `pre` and `post` in the buffer around it: clusters count from the start of
+        // `pre`, and the features apply to `text` alone.
+        let shape = |pre: &str, post: &str| -> Vec<ShapedGlyph> {
+            let mut buf = UnicodeBuffer::new();
+            for (i, c) in pre.char_indices().chain(text.char_indices().map(|(i, c)| (i + pre.len(), c))) {
+                buf.add(map(c), i as u32);
+            }
+            let tail = pre.len() + text.len();
+            for (i, c) in post.char_indices() {
+                buf.add(map(c), (tail + i) as u32);
+            }
+            buf.set_pre_context(context.before.get(..context.before.len().saturating_sub(pre.len())).unwrap_or(""));
+            buf.set_post_context(context.after.get(post.len()..).unwrap_or(""));
+            if let Ok(script) = script.short_name().parse() {
+                buf.set_script(script);
+            }
+            if let Some(language) = context.language.and_then(|t| t.parse::<Language>().ok()) {
+                buf.set_language(language);
+            }
+            buf.set_flags(harfrust::BufferFlags::PRODUCE_SAFE_TO_INSERT_TATWEEL);
+            buf.guess_segment_properties();
+            buf.set_direction(if rtl { Direction::RightToLeft } else { Direction::LeftToRight });
+            let ranged: Vec<Feature>;
+            let features = if pre.is_empty() && post.is_empty() {
+                features
+            } else {
+                let (start, end) = (pre.len() as u32, tail as u32);
+                ranged = features.iter().map(|f| Feature { start: f.start.max(start), end: f.end.min(end), ..*f }).collect();
+                &ranged
+            };
+            let gb = shaper.shape(buf, ShapeOptions::new().features(features));
+            gb.glyph_infos()
+                .iter()
+                .zip(gb.glyph_positions())
+                .map(|(info, pos)| ShapedGlyph {
+                    gid: info.glyph_id,
+                    cluster: info.cluster as usize,
+                    x_advance: pos.x_advance,
+                    y_advance: 0,
+                    x_offset: pos.x_offset,
+                    y_offset: pos.y_offset,
+                    safe_tatweel_before: info.safe_to_insert_tatweel(),
+                    rtl,
+                })
+                .collect()
+        };
+        let plain = shape("", "");
+        // A neighbouring run touching this one (no space between) is context for lookups that
+        // reach across the change of style, as in InDesign: Litoral's `ordn` needs the figure
+        // before the letter. Its glyphs are dropped again; the run's glyphs are used only when the
+        // context changed them, and only when no cluster straddles a boundary.
+        let (pre, post) = run_context(context.before, context.after, rtl, script);
+        let mut glyphs = plain;
+        if !(pre.is_empty() && post.is_empty()) && !text.is_empty() {
+            let wide = shape(pre, post);
+            let (start, end) = (pre.len(), pre.len() + text.len());
+            let has = |c: usize| wide.iter().any(|g| g.cluster == c);
+            if has(start) && (post.is_empty() || has(end)) {
+                let own: Vec<ShapedGlyph> =
+                    wide.into_iter().filter(|g| (start..end).contains(&g.cluster)).map(|g| ShapedGlyph { cluster: g.cluster - start, ..g }).collect();
+                if own.len() != glyphs.len() || own.iter().zip(&glyphs).any(|(a, b)| a.gid != b.gid || a.cluster != b.cluster) {
+                    glyphs = own;
+                }
+            }
         }
-        buf.set_pre_context(context.before);
-        buf.set_post_context(context.after);
-        if let Ok(script) = script.short_name().parse() {
-            buf.set_script(script);
-        }
-        if let Some(language) = context.language.and_then(|t| t.parse::<Language>().ok()) {
-            buf.set_language(language);
-        }
-        buf.set_flags(harfrust::BufferFlags::PRODUCE_SAFE_TO_INSERT_TATWEEL);
-        buf.guess_segment_properties();
-        buf.set_direction(if rtl { Direction::RightToLeft } else { Direction::LeftToRight });
-        let gb = shaper.shape(buf, ShapeOptions::new().features(features));
-        for (info, pos) in gb.glyph_infos().iter().zip(gb.glyph_positions()) {
-            out.push(ShapedGlyph {
-                gid: info.glyph_id,
-                cluster: info.cluster as usize,
-                x_advance: pos.x_advance,
-                y_advance: 0,
-                x_offset: pos.x_offset,
-                y_offset: pos.y_offset,
-                safe_tatweel_before: info.safe_to_insert_tatweel(),
-                rtl,
-            });
-        }
+        out.extend(glyphs);
     });
     if shaped.is_none()
         && let Some(f) = face.skrifa()
